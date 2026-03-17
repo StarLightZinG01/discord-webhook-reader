@@ -1,5 +1,26 @@
 require("dotenv").config();
+const express = require("express");
 const { Client, GatewayIntentBits } = require("discord.js");
+
+const app = express();
+app.use(express.json());
+
+const PORT = process.env.PORT || 3000;
+
+// สำหรับ Render health check
+app.get("/", (req, res) => {
+  res.status(200).send("discord-webhook-reader is running");
+});
+
+// เผื่ออยากเช็กสถานะเพิ่ม
+app.get("/health", (req, res) => {
+  res.status(200).json({ ok: true });
+});
+
+// เปิด port ให้ Render เห็น
+app.listen(PORT, () => {
+  console.log(`🌐 Web server running on port ${PORT}`);
+});
 
 const client = new Client({
   intents: [
@@ -12,11 +33,14 @@ const client = new Client({
 function detectProductType(text) {
   const raw = text.toLowerCase();
 
-  if (raw.includes("(steam offline)") || raw.includes("(epic offline)") || raw.includes("(บัญชีแชร์)")) {
+  if (
+    raw.includes("(steam offline)") ||
+    raw.includes("(epic offline)") ||
+    raw.includes("(บัญชีแชร์)")
+  ) {
     return "GAME_OFFLINE";
   }
 
-  // ตอนนี้ตามเงื่อนไขของคุณ ถ้าไม่ใช่ offline ให้ถือเป็น online account ก่อน
   if (raw.trim()) {
     return "ONLINE_ACCOUNT";
   }
@@ -30,22 +54,18 @@ function parseProductInfo(text) {
   let price = null;
   const productType = detectProductType(originalText);
 
-  // ดึงราคา เช่น (99 บาท)
   const priceMatch = productName.match(/\((\d+(?:\.\d+)?)\s*บาท\)/);
   if (priceMatch) {
     price = Number(priceMatch[1]);
-    productName = productName.replace(
-      /\s*\((\d+(?:\.\d+)?)\s*บาท\)\s*$/,
-      "",
-    ).trim();
+    productName = productName
+      .replace(/\s*\((\d+(?:\.\d+)?)\s*บาท\)\s*$/, "")
+      .trim();
   }
 
-  // ลบคำประเภทออกจากชื่อสินค้า
   productName = productName
     .replace(/\s*\((Steam|Epic)\s+Offline\)\s*/gi, " ")
     .trim();
 
-  // ตัดข้อความต่อท้ายหลัง " - "
   if (productName.includes(" - ")) {
     productName = productName.split(" - ")[0].trim();
   }
@@ -87,7 +107,7 @@ async function sendToNextjs(payload) {
 
   if (!res.ok) {
     throw new Error(
-      `Next.js API error: ${res.status} ${res.statusText} - ${JSON.stringify(data)}`,
+      `Next.js API error: ${res.status} ${res.statusText} - ${JSON.stringify(data)}`
     );
   }
 
@@ -116,11 +136,11 @@ client.on("messageCreate", async (message) => {
       const fields = embed.fields ?? [];
 
       const productField = fields.find(
-        (f) => f.name && f.name.includes("ข้อมูลสินค้า"),
+        (f) => f.name && f.name.includes("ข้อมูลสินค้า")
       );
 
       const buyerField = fields.find(
-        (f) => f.name && f.name.includes("ผู้ซื้อ"),
+        (f) => f.name && f.name.includes("ผู้ซื้อ")
       );
 
       if (!productField || !buyerField) {
