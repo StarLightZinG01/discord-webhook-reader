@@ -87,7 +87,11 @@ function parseBuyer(text) {
 }
 
 async function sendToNextjs(payload) {
-  const res = await fetch(process.env.NEXTJS_API_URL, {
+  return sendToApi(process.env.NEXTJS_API_URL, payload);
+}
+
+async function sendToApi(url, payload) {
+  const res = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -114,6 +118,102 @@ async function sendToNextjs(payload) {
   return data;
 }
 
+function normalizeEmbedText(text) {
+  return String(text || "")
+    .replace(/\*\*/g, "")
+    .trim();
+}
+
+function parseOutOfStockProductName(text) {
+  let productName = normalizeEmbedText(text);
+
+  // Remove the option and price, but keep the platform marker (Steam Offline).
+  productName = productName
+    .replace(/\s*\(\d+(?:\.\d+)?\s*บาท\)\s*$/i, "")
+    .trim();
+
+  if (productName.includes(" - ")) {
+    productName = productName.split(" - ")[0].trim();
+  }
+
+  return productName;
+}
+
+async function sendStockAlert(message, productText) {
+  const productName = parseOutOfStockProductName(productText);
+  if (!productName) {
+    console.log("พบแจ้งเตือนสินค้าหมด แต่ไม่สามารถอ่านชื่อสินค้าได้");
+    return;
+  }
+
+  const alertsApiUrl =
+    process.env.STOCK_ALERTS_API_URL ||
+    new URL("/api/stock-alerts", process.env.NEXTJS_API_URL).toString();
+
+  const apiResult = await sendToApi(alertsApiUrl, {
+    productName,
+    sourceMessageId: message.id,
+    source: "discord-webhook",
+  });
+
+  console.log(`แจ้งสินค้าหมดเข้าเว็บสำเร็จ: ${productName}`, apiResult);
+}
+
+async function handleOutOfStockContent(message) {
+  const lines = String(message.content || "")
+    .split(/\r?\n/)
+    .map(normalizeEmbedText)
+    .filter(Boolean);
+
+  if (!lines.some((line) => line.includes("สินค้าหมดแล้ว"))) return false;
+
+  const productHeadingIndex = lines.findIndex((line) =>
+    line.includes("ข้อมูลสินค้า"),
+  );
+  const productText =
+    productHeadingIndex >= 0 ? lines[productHeadingIndex + 1] : null;
+
+  if (!productText) {
+    console.log("พบแจ้งเตือนสินค้าหมด แต่ไม่พบข้อมูลสินค้า");
+    return true;
+  }
+
+  await sendStockAlert(message, productText);
+  return true;
+}
+
+async function handleOutOfStockEmbed(message, embed) {
+  const hasOutOfStockTitle = [embed.title, embed.description].some((text) =>
+    normalizeEmbedText(text).includes("สินค้าหมดแล้ว"),
+  );
+  if (!hasOutOfStockTitle) return false;
+
+  const fields = embed.fields ?? [];
+  const productField = fields.find((field) =>
+    normalizeEmbedText(field.name).includes("ข้อมูลสินค้า"),
+  );
+
+  const descriptionLines = String(embed.description || "")
+    .split(/\r?\n/)
+    .map(normalizeEmbedText)
+    .filter(Boolean);
+  const descriptionHeadingIndex = descriptionLines.findIndex((line) =>
+    line.includes("ข้อมูลสินค้า"),
+  );
+  const descriptionProduct =
+    descriptionHeadingIndex >= 0
+      ? descriptionLines[descriptionHeadingIndex + 1]
+      : null;
+
+  if (!productField && !descriptionProduct) {
+    console.log("พบแจ้งเตือนสินค้าหมด แต่ไม่พบข้อมูลสินค้า");
+    return true;
+  }
+
+  await sendStockAlert(message, productField?.value || descriptionProduct);
+  return true;
+}
+
 client.once("ready", () => {
   console.log(`✅ บอทออนไลน์แล้ว: ${client.user.tag}`);
 });
@@ -128,9 +228,12 @@ client.on("messageCreate", async (message) => {
     }
 
     if (!message.webhookId) return;
+    if (await handleOutOfStockContent(message)) return;
     if (!message.embeds || message.embeds.length === 0) return;
 
     for (const embed of message.embeds) {
+      if (await handleOutOfStockEmbed(message, embed)) continue;
+
       if (embed.title !== "พบการซื้อสินค้า") continue;
 
       const fields = embed.fields ?? [];
