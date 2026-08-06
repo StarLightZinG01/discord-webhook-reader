@@ -260,7 +260,9 @@ client.on("messageCreate", async (message) => {
         price: productParsed.price,
         productType: productParsed.productType,
         buyerName,
-        soldAt: new Date().toISOString(),
+        soldAt: message.createdAt
+          ? message.createdAt.toISOString()
+          : new Date().toISOString(),
         source: "discord-webhook",
       };
 
