@@ -49,16 +49,16 @@ function detectProductType(text) {
 }
 
 function parseProductInfo(text) {
-  const originalText = text.trim();
+  const originalText = normalizeEmbedText(text);
   let productName = originalText;
   let price = null;
   const productType = detectProductType(originalText);
 
-  const priceMatch = productName.match(/\((\d+(?:\.\d+)?)\s*บาท\)/);
+  const priceMatch = productName.match(/\(([\d,]+(?:\.\d+)?)\s*บาท\)/);
   if (priceMatch) {
-    price = Number(priceMatch[1]);
+    price = Number(priceMatch[1].replace(/,/g, ""));
     productName = productName
-      .replace(/\s*\((\d+(?:\.\d+)?)\s*บาท\)\s*$/, "")
+      .replace(/\s*\(([\d,]+(?:\.\d+)?)\s*บาท\)\s*$/, "")
       .trim();
   }
 
@@ -78,6 +78,7 @@ function parseProductInfo(text) {
 }
 
 function parseBuyer(text) {
+  text = normalizeEmbedText(text);
   const match = text.match(/^(.+?)\s*\(/);
   if (match) {
     return match[1].trim();
@@ -90,32 +91,46 @@ async function sendToNextjs(payload) {
   return sendToApi(process.env.NEXTJS_API_URL, payload);
 }
 
-async function sendToApi(url, payload) {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": process.env.IMPORT_API_KEY,
-    },
-    body: JSON.stringify(payload),
-  });
+// ลองใหม่เมื่อ network error / timeout / 5xx (เช่น Vercel cold start หรือ DB หลุดชั่วคราว)
+// shortcut: timeout ที่ปลายทางบันทึกไปแล้วอาจได้รายการซ้ำ เพราะ API ยังไม่มี idempotency key
+async function sendToApi(url, payload, attempts = 3) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": process.env.IMPORT_API_KEY,
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(20000),
+      });
 
-  const text = await res.text();
+      const text = await res.text();
 
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = text;
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = text;
+      }
+
+      if (!res.ok) {
+        const error = new Error(
+          `Next.js API error: ${res.status} ${res.statusText} - ${JSON.stringify(data)}`
+        );
+        error.retryable = res.status >= 500;
+        throw error;
+      }
+
+      return data;
+    } catch (error) {
+      const retryable = error.retryable ?? true; // network error / timeout
+      if (!retryable || attempt >= attempts) throw error;
+      console.warn(`⚠️ ส่ง API ไม่สำเร็จ (ครั้งที่ ${attempt}) จะลองใหม่:`, error.message);
+      await new Promise((resolve) => setTimeout(resolve, 3000 * attempt));
+    }
   }
-
-  if (!res.ok) {
-    throw new Error(
-      `Next.js API error: ${res.status} ${res.statusText} - ${JSON.stringify(data)}`
-    );
-  }
-
-  return data;
 }
 
 function normalizeEmbedText(text) {
@@ -218,64 +233,107 @@ client.once("ready", () => {
   console.log(`✅ บอทออนไลน์แล้ว: ${client.user.tag}`);
 });
 
-client.on("messageCreate", async (message) => {
+async function handlePurchaseEmbed(message, embed) {
+  const fields = embed.fields ?? [];
+
+  // ซื้อพร้อมกันหลายชิ้น อาจมาเป็นหลาย field "ข้อมูลสินค้า" ใน embed เดียว
+  // หรือหลายบรรทัดใน field เดียว เดิมใช้ find() จึงจดแค่ชิ้นแรก
+  const productFields = fields.filter(
+    (f) => f.name && f.name.includes("ข้อมูลสินค้า")
+  );
+
+  const buyerField = fields.find(
+    (f) => f.name && f.name.includes("ผู้ซื้อ")
+  );
+
+  if (productFields.length === 0 || !buyerField) {
+    console.log(
+      "⚠️ เจอหัวข้อซื้อสินค้า แต่ไม่พบ field ที่ต้องการ:",
+      JSON.stringify(fields)
+    );
+    return;
+  }
+
+  const buyerName = parseBuyer(buyerField.value || "");
+  const productTexts = productFields.flatMap((field) =>
+    splitProductLines(field.value || "")
+  );
+
+  if (productTexts.length > 1) {
+    console.log(`🛒 พบสินค้า ${productTexts.length} ชิ้นในข้อความเดียว`);
+  }
+
+  for (const productText of productTexts) {
+    await sendPurchase(message, embed, buyerName, productText);
+  }
+}
+
+// แยกหลายสินค้าใน field เดียว: แยกเฉพาะเมื่อทุกบรรทัดมีราคา "(xx บาท)" ไม่งั้นถือเป็นสินค้าเดียว
+function splitProductLines(value) {
+  const lines = String(value)
+    .split(/\r?\n/)
+    .map(normalizeEmbedText)
+    .filter(Boolean);
+  const allPriced = lines.every((line) => /\([\d,]+(?:\.\d+)?\s*บาท\)/.test(line));
+  return lines.length > 1 && allPriced ? lines : [value];
+}
+
+async function sendPurchase(message, embed, buyerName, productText) {
+  const productParsed = parseProductInfo(productText);
+
+  const result = {
+    title: embed.title,
+    productName: productParsed.productName,
+    price: productParsed.price,
+    productType: productParsed.productType,
+    buyerName,
+    soldAt: message.createdAt
+      ? message.createdAt.toISOString()
+      : new Date().toISOString(),
+    source: "discord-webhook",
+  };
+
+  console.log("\n==============================");
+  console.log("✅ พบรายการซื้อสินค้า");
+  console.log("==============================");
+  console.log(result);
+
   try {
-    if (
-      process.env.TARGET_CHANNEL_ID &&
-      message.channelId !== process.env.TARGET_CHANNEL_ID
-    ) {
-      return;
-    }
-
-    if (!message.webhookId) return;
-    if (await handleOutOfStockContent(message)) return;
-    if (!message.embeds || message.embeds.length === 0) return;
-
-    for (const embed of message.embeds) {
-      if (await handleOutOfStockEmbed(message, embed)) continue;
-
-      if (embed.title !== "พบการซื้อสินค้า") continue;
-
-      const fields = embed.fields ?? [];
-
-      const productField = fields.find(
-        (f) => f.name && f.name.includes("ข้อมูลสินค้า")
-      );
-
-      const buyerField = fields.find(
-        (f) => f.name && f.name.includes("ผู้ซื้อ")
-      );
-
-      if (!productField || !buyerField) {
-        console.log("⚠️ เจอหัวข้อซื้อสินค้า แต่ไม่พบ field ที่ต้องการ");
-        continue;
-      }
-
-      const productParsed = parseProductInfo(productField.value || "");
-      const buyerName = parseBuyer(buyerField.value || "");
-
-      const result = {
-        title: embed.title,
-        productName: productParsed.productName,
-        price: productParsed.price,
-        productType: productParsed.productType,
-        buyerName,
-        soldAt: message.createdAt
-          ? message.createdAt.toISOString()
-          : new Date().toISOString(),
-        source: "discord-webhook",
-      };
-
-      console.log("\n==============================");
-      console.log("✅ พบรายการซื้อสินค้า");
-      console.log("==============================");
-      console.log(result);
-
-      const apiResult = await sendToNextjs(result);
-      console.log("🚀 ส่งเข้า Next.js สำเร็จ:", apiResult);
-    }
+    const apiResult = await sendToNextjs(result);
+    console.log("🚀 ส่งเข้า Next.js สำเร็จ:", apiResult);
   } catch (error) {
-    console.error("❌ เกิดข้อผิดพลาด:", error);
+    // log payload ไว้ให้จดเองได้ เพราะรายการนี้ไม่ได้เข้าเว็บ
+    console.error("❌ จดรายการขายไม่สำเร็จ ต้องเพิ่มเอง:", JSON.stringify(result), error);
+  }
+}
+
+client.on("messageCreate", async (message) => {
+  if (
+    process.env.TARGET_CHANNEL_ID &&
+    message.channelId !== process.env.TARGET_CHANNEL_ID
+  ) {
+    return;
+  }
+
+  if (!message.webhookId) return;
+
+  // แจ้งสินค้าหมดแยกจากการจดรายการขาย: ข้อความเดียวกันอาจมีทั้งสองอย่าง (ซื้อชิ้นสุดท้าย)
+  try {
+    await handleOutOfStockContent(message);
+  } catch (error) {
+    console.error("❌ ส่งแจ้งสินค้าหมดไม่สำเร็จ:", error);
+  }
+
+  for (const embed of message.embeds ?? []) {
+    if (normalizeEmbedText(embed.title).includes("พบการซื้อสินค้า")) {
+      await handlePurchaseEmbed(message, embed);
+    }
+
+    try {
+      await handleOutOfStockEmbed(message, embed);
+    } catch (error) {
+      console.error("❌ ส่งแจ้งสินค้าหมดไม่สำเร็จ:", error);
+    }
   }
 });
 
